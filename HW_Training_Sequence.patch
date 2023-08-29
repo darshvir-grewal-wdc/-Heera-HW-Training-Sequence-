@@ -1,0 +1,691 @@
+diff --git a/Source/BE/APIincludes/be_diagnostics_API.h b/Source/BE/APIincludes/be_diagnostics_API.h
+index d291dcd788..a52ab0030a 100644
+--- a/Source/BE/APIincludes/be_diagnostics_API.h
++++ b/Source/BE/APIincludes/be_diagnostics_API.h
+@@ -166,6 +166,8 @@ Status_t OVL_SendHostAllCounterEntries SendHostAllCounterEntries(uint8 *pBuf, ui
+ void OVL_GetNumLLSAndCountersEntries GetNumLLSAndCountersEntries(uint8 *pBuff, uint32 numRecords, uint16 *numLLSEntries, uint16 *numCountersEntries);
+ Status_t OVL_Diag_ToggleModeCommand Diag_ToggleModeCommand(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors);
+ Status_t OVL_Diag_GetClkMeasurementData Diag_GetClkMeasurementData(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors);
++Status_t OVL_Diag_HWTrainingSequence_Mult Diag_HWTrainingSequence_Mult(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors);
++Status_t OVL_Diag_HWTrainingSequence_Shift Diag_HWTrainingSequence_Shift(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors);
+ #if PROD_FELIX
+ Status_t OVL_Diag_WriteSFR Diag_WriteSFR(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors);
+ #endif//PROD_FELIX
+diff --git a/Source/BE/APIincludes/be_fw_OGN.h b/Source/BE/APIincludes/be_fw_OGN.h
+index cb19832604..8e1ce5399a 100644
+--- a/Source/BE/APIincludes/be_fw_OGN.h
++++ b/Source/BE/APIincludes/be_fw_OGN.h
+@@ -61,6 +61,8 @@
+ #define OVL_Diag_GetNextErasedAddress                              OVLGRP(Diag_GetNextErasedAddress)
+ #define OVL_Diag_ToggleModeCommand                                 OVLGRP(Diag_ToggleModeCommand)
+ #define OVL_Diag_GetClkMeasurementData                             OVLGRP(Diag_GetClkMeasurementData)
++#define OVL_Diag_HWTrainingSequence_Mult 						   OVLGRP(Diag_HWTrainingSequence_Mult)
++#define OVL_Diag_HWTrainingSequence_Shift 						   OVLGRP(Diag_HWTrainingSequence_Shift)
+ #define OVL_Diag_WriteSFR                                          OVLGRP(Diag_WriteSFR)
+ #define OVL_Diag_ReadRelinkEntryOffset                             OVLGRP(Diag_ReadRelinkEntryOffset)
+ #define OVL_Diag_MML_GetRRCounter                                  OVLGRP(Diag_MML_GetRRCounter)
+diff --git a/Source/BE/Diagnostic/BE_Diagnostics_Dispatcher.c b/Source/BE/Diagnostic/BE_Diagnostics_Dispatcher.c
+index a2d27779bb..ff4f8926a3 100644
+--- a/Source/BE/Diagnostic/BE_Diagnostics_Dispatcher.c
++++ b/Source/BE/Diagnostic/BE_Diagnostics_Dispatcher.c
+@@ -3233,6 +3233,606 @@ Status_t OVL_Diag_GetEfuseData Diag_GetEfuseData(SCTP_APP_STATE_e state, uint8 *
+ ///
+ //----------------------------------------------------------------------------------------------------
+ #ifdef RAM
++
++#define ALL_BIT_LINES_PASSING 0x00
++#define ALL_BIT_LINES_FAILING 0xFF
++#define MAX_DQS_MULT 256
++#define MAX_DQS_SHIFT 64
++
++uint8 DQS_Mult_Map[MAX_DQS_MULT] = {0};
++uint8 DQS_Shift_Map[MAX_DQS_SHIFT] = {0};
++
++uint64 trainingSequenceStartTime = 0;
++uint64 trainingSequenceEndTime = 0;
++
++
++uint8 isBitlineStatusFail(uint8 byteStatus, uint8 bitline)
++{
++	return (!(byteStatus & (0x1 << bitline)));
++}
++
++uint8 compareBytebyByte(uint32* const writeBuffer, uint32* const readBuffer, uint16 bytesWritten)
++{
++	uint32 byteIndex;
++	uint8 result = 0;
++	uint8 volatile *write = (uint8 *)writeBuffer;
++	uint8 volatile *read = (uint8 *)readBuffer;
++	uint8 volatile writeValue;
++	uint8 volatile readValue;
++	for(byteIndex = 0;byteIndex < bytesWritten; ++byteIndex)
++	{
++		writeValue = write[byteIndex];
++		readValue = read[byteIndex];
++		result |= (writeValue ^ readValue);
++		if(result != 0)
++			//_brk();
++		if (result == ALL_BIT_LINES_FAILING)
++		{
++			//_brk();
++			break;
++		}
++	}
++	return result;
++}
++	
++uint8 FD_BitAlignment(uint32 *writeBuffer,uint32 *readBuffer,uint16 bytesWritten,bool isWriteTraining,uint8 CE,uint8 die)
++{
++	uint32 locRegVal;
++	uint8 status = ALL_BIT_LINES_PASSING;
++	uint16 FD_Mult = 0;
++	uint8 locFdbitIdx = 0;
++	uint8 locCfgidx = 0;
++
++	
++	//Chip Select
++	uint8 logicalDie;
++
++#ifdef PROD_FEATURE_CE_OVER_GPIO
++	f_dfdHcm_apiSelectHWChip(CE);
++#endif
++
++	logicalDie = (CE * D_DIE_INTERLEAVE) + die;
++	if(GPIO_CHIP_SELECTION(CE))
++	{
++	 logicalDie = logicalDie % D_DIE_INTERLEAVE;
++	}
++			  
++	die = logicalDie;
++	//Writing to NAND XDL for WDQS/RDQS RDQSn training
++	for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++	{
++		f_dfd_toggleModeLoopWrite(die, planeNum, (void *)writeBuffer, bytesWritten);
++		f_nohRun_apiEnableOperationEndInterrupt();
++		if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++		{ 
++		   _brk(); //Write Failed
++		}
++		
++	}
++	//_brk();
++	//Setting WDQS/RDQS RDQSn Mult and shift to 0
++	for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++	{
++		locRegVal = locCfgidx;
++		M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++		if(!isWriteTraining)
++		{
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG0_OFFSET, 0);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG1_OFFSET, 0);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG0_OFFSET, 0);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG1_OFFSET, 0);
++
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RFD_SDL_CFG1_OFFSET, 0);
++		}
++		else
++		{
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG0_OFFSET, 0);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG1_OFFSET, 0);
++
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WFD_SDL_CFG1_OFFSET, 0);
++		}
++	}
++
++	//_brk();
++	while((status != ALL_BIT_LINES_FAILING) && (FD_Mult < 64))
++	{
++		for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++		{
++			for (locFdbitIdx = 0; locFdbitIdx <= D_FW_FIM2_FIM_FI_SDL_FDBIT_CNT; ++locFdbitIdx)
++			{
++				if(isBitlineStatusFail(status, locFdbitIdx))
++				{
++					locRegVal = ((locFdbitIdx << 5) | locCfgidx);
++
++					//Selecting the FD Bus which is passing and incrementing the RFD Mult value
++					if(!isWriteTraining)
++					{
++						M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++						M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RFD_SDL_CFG0_OFFSET, FD_Mult);
++					}
++					else
++					{
++						M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++						M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WFD_SDL_CFG0_OFFSET, FD_Mult);
++					}
++					//TBD:Die Mapping Required
++				}
++			}
++		}
++		if(isWriteTraining)
++		{			
++			//Write to NAND XDL using TM Loop Back APIs
++			for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++			{
++				f_dfd_toggleModeLoopWrite(die, planeNum, (void *)writeBuffer, bytesWritten);
++				f_nohRun_apiEnableOperationEndInterrupt();
++				if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++				{ 
++				   _brk(); //Write Failed
++				}
++			}
++
++		}
++		//Reading from NAND XDL
++		memset(readBuffer, 0x00, bytesWritten);
++        for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++        {
++        	f_dfd_toggleModeLoopRead(die, planeNum, (void *)readBuffer, bytesWritten);
++			f_nohRun_apiEnableOperationEndInterrupt();
++			if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++			{ 
++			   _brk(); //Read Failed
++			}
++
++        }
++		//_brk();
++		//Comparing write and read buffer data
++		status =  compareBytebyByte(writeBuffer,readBuffer,bytesWritten);
++		++FD_Mult;
++		if(FD_Mult >= 64)
++		{
++			_brk(); //FD Mult overflowed the specified range
++		}
++		//_brk();
++	}
++	//_brk();
++	//Chip De-Select
++#ifdef PROD_FEATURE_CE_OVER_GPIO
++	f_dfdHcm_apiDeSelectHWChip(CE);
++#endif
++	return status;
++}
++
++void dqsTraining(uint32 *writeBuffer,uint32 *readBuffer,uint16 bytesWritten,bool isWriteTraining,uint8 CE,uint8 die,bool isMULT)
++{
++	//Chip Select  
++    uint8 logicalDie;
++
++#ifdef PROD_FEATURE_CE_OVER_GPIO
++	f_dfdHcm_apiSelectHWChip(CE);
++#endif
++	logicalDie = (CE * D_DIE_INTERLEAVE) + die;
++	if(GPIO_CHIP_SELECTION(CE))
++	{
++		logicalDie = logicalDie % D_DIE_INTERLEAVE;
++	}
++		  
++	die = logicalDie;
++	
++	for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++	{
++		f_dfd_toggleModeLoopWrite(die, planeNum, (void *)writeBuffer, bytesWritten);
++		f_nohRun_apiEnableOperationEndInterrupt();
++		if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++		{ 
++		   _brk(); //Write Failed
++		}
++	}
++	
++	uint8 locCfgidx = 0;
++	uint32 locRegVal;
++
++	if(isMULT){
++		uint16 DQS_Mult = 0;
++
++		while(DQS_Mult < MAX_DQS_MULT)
++		{
++			for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++			{
++				locRegVal = locCfgidx;
++				M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++				if(!isWriteTraining)
++				{
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG0_OFFSET, DQS_Mult);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG1_OFFSET, 0);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG0_OFFSET, DQS_Mult);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG1_OFFSET, 0);
++
++				}
++				else
++				{
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG0_OFFSET, DQS_Mult);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG1_OFFSET, 0);
++				}
++			}
++
++			if(isWriteTraining)
++			{
++				//Write to NAND XDL using TM Loop Back APIs
++				for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++				{
++					f_dfd_toggleModeLoopWrite(die, planeNum, (void *)writeBuffer, bytesWritten);
++					f_nohRun_apiEnableOperationEndInterrupt();
++					if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++					{ 
++					   _brk(); //Write Failed
++					}
++				}
++			}
++
++			//Reading from NAND XDL
++			memset(readBuffer, 0x00, bytesWritten);
++	        for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++	        {
++	        	f_dfd_toggleModeLoopRead(die, planeNum, (void *)readBuffer, bytesWritten);
++				f_nohRun_apiEnableOperationEndInterrupt();
++				if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++				{ 
++				   _brk(); //Read Failed
++				}
++	        }
++
++			if( GOOD_COMPARE == memcmp((void *)writeBuffer, (void *)readBuffer, bytesWritten))
++			{
++				DQS_Mult_Map[DQS_Mult] = 1;
++			}
++			DQS_Mult++;
++		}
++	}
++	else{
++		uint16 DQS_Shift = 0;
++
++		while(DQS_Shift < MAX_DQS_SHIFT)
++		{
++			for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++			{
++				locRegVal = locCfgidx;
++				M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++				if(!isWriteTraining)
++				{
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG0_OFFSET, 0x41);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG1_OFFSET, DQS_Shift);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG0_OFFSET, 0x41);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG1_OFFSET, DQS_Shift);
++
++				}
++				else
++				{
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG0_OFFSET, 0x41);
++					M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG1_OFFSET, DQS_Shift);
++				}
++			}
++
++			if(isWriteTraining)
++			{
++				//Write to NAND XDL using TM Loop Back APIs
++				for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++				{
++					f_dfd_toggleModeLoopWrite(die, planeNum, (void *)writeBuffer, bytesWritten);
++					f_nohRun_apiEnableOperationEndInterrupt();
++					if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++					{ 
++					   _brk(); //Write Failed
++					}
++				}
++			}
++
++			//Reading from NAND XDL
++			memset(readBuffer, 0x00, bytesWritten);
++	        for(uint8 planeNum = 0; (planeNum < CFG_Conf.planesPerChip); planeNum++)
++	        {
++	        	f_dfd_toggleModeLoopRead(die, planeNum, (void *)readBuffer, bytesWritten);
++				f_nohRun_apiEnableOperationEndInterrupt();
++				if(f_dfdSco_apiWaitForOperationComplete() == FALSE)
++				{ 
++				   _brk(); //Read Failed
++				}
++	        }
++
++			if( GOOD_COMPARE == memcmp((void *)writeBuffer, (void *)readBuffer, bytesWritten))
++			{
++				DQS_Shift_Map[DQS_Shift] = 1;
++			}
++			DQS_Shift++;
++		}
++	}
++	//Chip De-Select
++#ifdef PROD_FEATURE_CE_OVER_GPIO
++	f_dfdHcm_apiDeSelectHWChip(CE);
++#endif
++}
++
++uint32 findOptimalValue(uint8 *pBuf,bool isWriteTraining,bool isMULT)
++{
++	uint32 value = 0;
++	uint8_t lowerPassingValue = 0;
++	uint8_t upperPassingValue = 0;
++
++	uint16 maxIndex = -1;
++	uint16 maxLength = 0;
++	uint16 currIndex = -1;
++	uint16 currLength = 0;
++
++	if(isMULT){
++		for (uint16 i = 0; i < MAX_DQS_MULT; i++)
++		{
++			if (DQS_Mult_Map[i] == 1)
++			{
++				if (currLength == 0)
++					currIndex = i;
++				currLength++;
++
++				if (currLength > maxLength)
++				{
++					maxLength = currLength;
++					maxIndex = currIndex;
++				}
++			}
++			else
++				currLength = 0;
++		}
++	}
++	else{
++		for (uint16 i = 0; i < MAX_DQS_SHIFT; i++)
++		{
++			if (DQS_Shift_Map[i] == 1)
++			{
++				if (currLength == 0)
++					currIndex = i;
++				currLength++;
++
++				if (currLength > maxLength)
++				{
++					maxLength = currLength;
++					maxIndex = currIndex;
++				}
++			}
++			else
++				currLength = 0;
++		}
++	}
++
++	lowerPassingValue = maxIndex;
++	upperPassingValue = maxIndex + maxLength;
++
++	//TBD: Selection Criteria
++	value = (uint32)((lowerPassingValue + upperPassingValue)/2);
++
++	//Writing lower and upper passing value to buffer space
++	if (!isWriteTraining)
++	{
++		memset(pBuf, 0, 1);
++  		memcpy(pBuf,&lowerPassingValue, sizeof(uint8_t));
++		memset(pBuf+1, 0, 1);
++  		memcpy(pBuf+1,&upperPassingValue, sizeof(uint8_t));
++	}
++	else
++	{
++		memset(pBuf+2, 0, 1);
++  		memcpy(pBuf+2,&lowerPassingValue, sizeof(uint8_t));
++		memset(pBuf+3, 0, 1);
++  		memcpy(pBuf+3,&upperPassingValue, sizeof(uint8_t));
++	}
++
++	return value;
++}
++
++void HWTrainingSequence(uint8 CE,uint8 die,uint8 *pBuf,bool isMULT)
++{
++	uint8 FDBitsAligned;
++	uint8  locCfgidx;
++	uint32 locRegVal;
++
++	//Alocating BRAM Sectors for read/write/compare option
++	uint16 numSecAllocated = 8;
++	uint32 numEblocks = D_FMUS_PER_PAGE;
++	uint16 bytesWritten = numEblocks * D_ROM_NAND_EBLOCK_SIZE_BYTES_X3;
++	numSecAllocated = numSecAllocated + (D_SECTORS_PER_FMU - (numSecAllocated % D_SECTORS_PER_FMU));
++
++	uint32 *writeBuffer = (uint32 *const )f_lldp_CopyBuffer_Allocate(numSecAllocated);
++	memset(writeBuffer, 0x00, bytesWritten);
++	//_brk();
++	uint32 *readBuffer = (uint32 *)(writeBuffer + (((((bytesWritten - 1) >> LOG2_SECTOR_SIZE) + 1) << LOG2_SECTOR_SIZE) >> 1));
++	bytesWritten >>=1;
++	uint32 *writeBufferTemp = writeBuffer;
++	
++	for(uint16_t bytesProgrammed = 0;bytesProgrammed < bytesWritten/4;bytesProgrammed++)
++	{
++		uint8 *writeBuffer1 = (uint8 *)writeBufferTemp;
++		uint8 *writeBuffer2 = writeBuffer1 + 1;
++		uint8 *writeBuffer3 = writeBuffer1 + 2;
++		uint8 *writeBuffer4 = writeBuffer1 + 3;
++
++		memset(writeBuffer1,0xAA,1);
++		memset(writeBuffer2,0x55,1);
++		memset(writeBuffer3,0xAA,1);
++		memset(writeBuffer4,0x55,1);
++
++		writeBufferTemp++;
++	}
++
++	//RDQS RDQSn Training
++
++	//Adjusting FD Bit Lines to failing value
++	FDBitsAligned = FD_BitAlignment(writeBuffer,readBuffer,bytesWritten,false,CE,die);
++	if(FDBitsAligned != ALL_BIT_LINES_FAILING)
++		_brk();
++
++	//Sweeping accross RDQS Mult/Shift for passing window
++	if(isMULT)
++		dqsTraining(writeBuffer,readBuffer,bytesWritten,false,CE,die,true);
++	else
++		dqsTraining(writeBuffer,readBuffer,bytesWritten,false,CE,die,false);
++
++	//_brk();
++
++	uint16 counterDQS = 0;
++	uint32 value = findOptimalValue(pBuf,FALSE,isMULT);
++
++	if(isMULT){
++		for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++		{
++			locRegVal = locCfgidx;
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG0_OFFSET, value);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG1_OFFSET, 0);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG0_OFFSET, value);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG1_OFFSET, 0);
++
++		}
++	//_brk();
++		for(counterDQS = 0;counterDQS < MAX_DQS_MULT;counterDQS++)
++			DQS_Mult_Map[counterDQS] = 0;
++	}
++	else{
++		for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++		{
++			locRegVal = locCfgidx;
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG0_OFFSET, 0x41);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQS_SDL_CFG1_OFFSET, value);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG0_OFFSET, 0x41);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_RDQSN_SDL_CFG1_OFFSET, value);
++
++		}
++	//_brk();
++		for(counterDQS = 0;counterDQS < MAX_DQS_SHIFT;counterDQS++)
++			DQS_Shift_Map[counterDQS] = 0;
++	}
++
++	//Adjusting FD Bit Lines to failing value
++	FDBitsAligned = FD_BitAlignment(writeBuffer,readBuffer,bytesWritten,true,CE,die);
++	if(FDBitsAligned != ALL_BIT_LINES_FAILING)
++		_brk();
++
++	//WDQS Training
++	if(isMULT)
++		dqsTraining(writeBuffer,readBuffer,bytesWritten,true,CE,die,true);
++	else
++		dqsTraining(writeBuffer,readBuffer,bytesWritten,true,CE,die,false);
++
++	//_brk();
++	
++	counterDQS = 0;
++	value = findOptimalValue(pBuf,TRUE,isMULT);
++
++	if(isMULT){
++		for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++			{
++				locRegVal = locCfgidx;
++				M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++				M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG0_OFFSET, value);
++				M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG1_OFFSET, 0);
++			}
++
++		//_brk();
++		for(counterDQS = 0;counterDQS < MAX_DQS_MULT;counterDQS++)
++			DQS_Mult_Map[counterDQS] = 0;
++	}
++	else{
++		for (locCfgidx = 0; locCfgidx < D_FW_FIM2_FIM_FI_SDL_ENTRY_CNT; ++locCfgidx)
++		{
++			locRegVal = locCfgidx;
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_SDL_ENTRY_IDX_OFFSET, D_DFD_INIT_STP_FIM_TM_FI_PHY_SDL_ENTRY_IDX((uint8)locRegVal));
++
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG0_OFFSET, 0x41);
++			M_DFD_HCM_WRITE_16_BIT_REGISTER(D_FIM_REG_FI_PHY_WDQS_SDL_CFG1_OFFSET, value);
++		}
++
++	//_brk();
++		for(counterDQS = 0;counterDQS < MAX_DQS_SHIFT;counterDQS++)
++			DQS_Shift_Map[counterDQS] = 0;
++	}
++
++	f_lldp_CopyBuffer_Release((uint32)writeBuffer,numSecAllocated);
++}
++
++Status_t OVL_Diag_HWTrainingSequence_Shift Diag_HWTrainingSequence_Shift(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors)
++{
++   Status_t status = STATUS_OK;
++   uint32_t bytesTransferred = 0;
++   
++   struct _CDB_t
++   {
++      uint8 opcode;
++      uint8 CE;
++      uint8 Die;
++      uint8 reserved1;
++      uint16 reserved2;
++      uint16 reserved3;
++      uint16 reserved4[4];
++   } *pCDB = (struct _CDB_t *)(void *)pAppCmdData;
++   
++   uint8 *pBuf = NULL;
++   /*!* allocate a sector of memory */
++   if ((pBuf = (uint8 *)BE_AllocTRAMSectors(1)) == NULL) 
++   		return(STATUS_ERR);
++
++   memset(pBuf, 0, SECTOR_SIZE_BYTE);
++   //_brk();
++   HWTrainingSequence(pCDB->CE,pCDB->Die,pBuf,FALSE);
++   
++   /*!* Send the data */
++   status = FE_HostByteTransfer(SEND_TO_HOST, pBuf, *numSectors << LOG2_SECTOR_SIZE, &bytesTransferred);
++   
++   /*!* free the buffer */
++   BE_FreeTRAMSectors(pBuf, 1);
++   
++   return(status);
++}
++
++
++Status_t OVL_Diag_HWTrainingSequence_Mult Diag_HWTrainingSequence_Mult(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors)
++{
++   Status_t status = STATUS_OK;
++   uint32_t bytesTransferred = 0;
++   
++   struct _CDB_t
++   {
++      uint8 opcode;
++      uint8 CE;
++      uint8 Die;
++      uint8 reserved1;
++      uint16 reserved2;
++      uint16 reserved3;
++      uint16 reserved4[4];
++   } *pCDB = (struct _CDB_t *)(void *)pAppCmdData;
++   
++   uint8 *pBuf = NULL;
++   /*!* allocate a sector of memory */
++   if ((pBuf = (uint8 *)BE_AllocTRAMSectors(1)) == NULL) 
++   		return(STATUS_ERR);
++
++   memset(pBuf, 0, SECTOR_SIZE_BYTE);
++   //_brk();
++   HWTrainingSequence(pCDB->CE,pCDB->Die,pBuf,TRUE);
++   
++   /*!* Send the data */
++   status = FE_HostByteTransfer(SEND_TO_HOST, pBuf, *numSectors << LOG2_SECTOR_SIZE, &bytesTransferred);
++   
++   /*!* free the buffer */
++   BE_FreeTRAMSectors(pBuf, 1);
++   
++   return(status);
++}
++
++
+ Status_t OVL_Diag_GetClkMeasurementData Diag_GetClkMeasurementData(SCTP_APP_STATE_e state, uint8 *pAppCmdData, uint32 *numSectors)
+ {
+    Status_t status = STATUS_OK;
+diff --git a/Source/BE/MML/LOCincludes/common.h b/Source/BE/MML/LOCincludes/common.h
+index e3917318fd..46e4a36c07 100644
+--- a/Source/BE/MML/LOCincludes/common.h
++++ b/Source/BE/MML/LOCincludes/common.h
+@@ -42,6 +42,9 @@
+ #include "DLM_API.h"
+ #endif /* PROD_DYNAMIC_RELINKING */
+ 
++#define GPIO_CHIP_SELECTION(chipNum)   (chipNum > 1) ? TRUE : FALSE
++
++
+ //Used to control usage of prefix cmdC6 before erase operation for pre-programming partially written block
+ //Impact of not using: Data reliability issues
+ #define PREPRG_PARTIALLY_WRITTEN_BLK_BEFORE_ERASE
+diff --git a/Source/Diagnostic/APIincludes/DIAG_CmdHandler_Fw.h b/Source/Diagnostic/APIincludes/DIAG_CmdHandler_Fw.h
+index 7a7599e4a6..46b0d8375f 100644
+--- a/Source/Diagnostic/APIincludes/DIAG_CmdHandler_Fw.h
++++ b/Source/Diagnostic/APIincludes/DIAG_CmdHandler_Fw.h
+@@ -159,6 +159,8 @@ Status_t OVL_DIAG_AppHandler_VendorExt DIAG_AppHandler_VendorExt(SCTP_APP_STATE_
+ 
+ #define DIAG_CMD_OPCODE_SELECT_BE_CONF_PERF        0xF6
+ #define DIAG_CMD_OPCODE_GET_CLK_DATA               0xF1
++#define DIAG_CMD_OPCODE_HWTraingSequence_Mult	   0xF7
++#define DIAG_CMD_OPCODE_HWTraingSequence_Shift	   0xF8
+ #define DIAG_CMD_OPCODE_TOGGLE_MODE                0xF9
+ #define DIAG_CMD_OPCODE_WRITE_SFR                  0xBB
+ 
+diff --git a/Source/Diagnostic/DIAG_CmdHandler_Fw.c b/Source/Diagnostic/DIAG_CmdHandler_Fw.c
+index 32ca92709b..6bd7213376 100644
+--- a/Source/Diagnostic/DIAG_CmdHandler_Fw.c
++++ b/Source/Diagnostic/DIAG_CmdHandler_Fw.c
+@@ -136,6 +136,8 @@ const DIAG_CmdTbl_t CONST_LOCATION diagCmdTbl_Fw[] =
+       { DIAG_CMD_OPCODE_GET_CACHE_DATA                  , READ_DATA                                , Diag_GetCacheData                  },
+       { DIAG_CMD_OPCODE_TOGGLE_MODE                     , WRITE_DATA                               , Diag_ToggleModeCommand             },
+       { DIAG_CMD_OPCODE_GET_CLK_DATA                    , READ_DATA                                , Diag_GetClkMeasurementData         },
++      { DIAG_CMD_OPCODE_HWTraingSequence_Mult           , READ_DATA                                , Diag_HWTrainingSequence_Mult		},
++      { DIAG_CMD_OPCODE_HWTraingSequence_Shift          , READ_DATA                                , Diag_HWTrainingSequence_Shift			},
+ #if PROD_FELIX
+       { DIAG_CMD_OPCODE_WRITE_SFR                       , WRITE_DATA                               , Diag_WriteSFR                      },
+ #endif//PROD_FELIX
+diff --git a/Source/Product/product_sarang_usb.config b/Source/Product/product_sarang_usb.config
+index fc1e91af00..37c7feee26 100644
+--- a/Source/Product/product_sarang_usb.config
++++ b/Source/Product/product_sarang_usb.config
+@@ -351,7 +351,7 @@ products =
+          "LPM",                              -- Temp macro for Low Power Mode
+          "BER_BASED_EPWR",                   -- this will enable BER based EPWR feature
+          "EPWR_ALL_ECC_PAGES",                -- All Ecc pages BER based EPWR changes
+-         "IDLE_POWER_SAVING_MODE",            -- Idle time power saving when system idle for 60 sec
++         --"IDLE_POWER_SAVING_MODE",            -- Idle time power saving when system idle for 60 sec
+          "WA_SCAN_WL_ZONE_BASED_DAC_SHIFT",   -- Zone based DAC Shift on WAed pages
+          "ZQ_ASIC_CALIBRATION",               -- ASIC ZQ Caliberation
+          "FIM2_MAX_TIMEOUT_THRESHOLD",        -- FIM2 max timeout for worst case timeouts
+
