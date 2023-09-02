@@ -22,4 +22,4 @@ Observation:
 	9. Run the MULT Chaz training on these 3 combinations.
 
 Observation:
-	Compare the previous VW sizes to new VW sizes.
+	Compare the previous VW sizes to new VW sizes and see the difference.
