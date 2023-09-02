@@ -1,0 +1,25 @@
+Steps for 16D Bringup:
+	1. Run 25 OQRM on 0C, 25C and 45C on 3 TT samples on 8D.
+	2. Check the OQRM cycle # where NAND Temperature saturates.
+	3. Run OQRM cycles on:
+		a. FF 0C
+		b. TT 25C
+		c. SS 45C
+		till the NAND temperature saturates.
+	4. Run the MULT Chaz training on these 3 combinations.
+	5. Power cycle the card.
+	6. Read the FIM registers for new CALP CALN codes.
+	
+Observation:
+	Check how much delta is between the CALP CALN values at 25C and the saturated temperature for 3 combinations.
+
+	7. Hard code the new CALP CALN codes in init time for the 3 combinations.
+	8. Re-run OQRM cycles on:
+		a. FF 0C
+		b. TT 25C
+		c. SS 45C
+		till the NAND temperature saturates.
+	9. Run the MULT Chaz training on these 3 combinations.
+
+Observation:
+	Compare the previous VW sizes to new VW sizes and see the difference.
