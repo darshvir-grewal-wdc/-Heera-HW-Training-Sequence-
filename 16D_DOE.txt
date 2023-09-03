@@ -1,7 +1,7 @@
 Steps for 16D Bringup:
 	1. Run 25 OQRM on 0C, 25C and 45C on 3 TT samples on 8D.
 	2. Check the OQRM cycle # where NAND Temperature saturates.
-	3. Run OQRM cycles on:
+	3. Run OQRM on:
 		a. FF 0C
 		b. TT 25C
 		c. SS 45C
@@ -11,10 +11,10 @@ Steps for 16D Bringup:
 	6. Read the FIM registers for new CALP CALN codes.
 	
 Observation:
-	Check how much delta is between the CALP CALN values at 25C and the saturated temperature for 3 combinations.
+	Check how much delta is between the CALP CALN values at 25C and the highest NAND temperature for 3 combinations.
 
-	7. Hard code the new CALP CALN codes in init time for the 3 combinations.
-	8. Re-run OQRM cycles on:
+	7. Hard code the new CALP CALN codes during init time for the 3 combinations.
+	8. Re-run OQRM cycles on with new CALP CALN codes:
 		a. FF 0C
 		b. TT 25C
 		c. SS 45C
