@@ -1,0 +1,1 @@
+Working FW with ASIC ZQ init in init flow.
